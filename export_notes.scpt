@@ -228,16 +228,17 @@ on run argv
                             log "Checked " & totalNotesOverall & " notes so far..."
                         end if
 
-                        -- Quick incremental update check (all in-memory, no Apple Events)
+                        -- Quick incremental update check using single-pass lookup (all in-memory, no Apple Events)
                         set shouldProcess to false
+                        set oldFileName to ""
                         if updateAllNotes then
                             set shouldProcess to true
+                        else if latestExistingModDate is missing value or noteModDate > latestExistingModDate then
+                            set shouldProcess to true
                         else
-                            if latestExistingModDate is missing value or noteModDate > latestExistingModDate then
-                                set shouldProcess to true
-                            else
-                                set shouldProcess to my shouldProcessNote(existingData, noteID, noteModDate)
-                            end if
+                            set processInfo to my getProcessingInfo(existingData, noteID, noteModDate)
+                            set shouldProcess to (shouldProcess of processInfo)
+                            set oldFileName to (oldFilename of processInfo)
                         end if
 
                         if shouldProcess then
@@ -247,14 +248,15 @@ on run argv
                             set noteTitle to my makeValidFilename(name of theNote)
                             set noteName to my generateFilename(envFilenameFormat, noteTitle, noteID, accountName, folderName, accountID, shortAccountID)
 
-                            -- Get old filename for comparison
-                            set oldFileName to ""
-                            repeat with currentRecord in existingData
-                                if (noteID_key of currentRecord) = noteID then
-                                    set oldFileName to (filename of currentRecord)
-                                    exit repeat
-                                end if
-                            end repeat
+                            -- Get old filename if not already fetched via getProcessingInfo
+                            if oldFileName is "" then
+                                repeat with currentRecord in existingData
+                                    if (noteID_key of currentRecord) = noteID then
+                                        set oldFileName to (filename of currentRecord)
+                                        exit repeat
+                                    end if
+                                end repeat
+                            end if
 
                             set folderNoteCount to folderNoteCount + 1
                             set totalNotesOutput to totalNotesOutput + 1
@@ -462,21 +464,18 @@ end createDirectory
 -- Subroutine to write content to a file (with UTF-8 encoding support)
 on writeToFile(filePath, content)
     try
-        -- Convert the file path to a file object
         set fileObject to POSIX file filePath
-        -- Try to open the file for access
         set fileDescriptor to open for access fileObject with write permission
-        write content to fileDescriptor starting at eof as «class utf8»
+        set eof of fileDescriptor to 0
+        write content to fileDescriptor as «class utf8»
         close access fileDescriptor
     on error errMsg
-        -- Log the error message
         log "Error writing to file: " & errMsg
-
-        -- If the file does not exist, create it and then open for access
         close access
         do shell script "touch " & quoted form of filePath
         set fileDescriptor to open for access fileObject with write permission
-        write content to fileDescriptor starting at eof as «class utf8»
+        set eof of fileDescriptor to 0
+        write content to fileDescriptor as «class utf8»
         close access fileDescriptor
     end try
 end writeToFile
@@ -684,36 +683,34 @@ on splitByDelimiter(textString, delimiter)
     return textItems
 end splitByDelimiter
 
--- Update note data record with comprehensive metadata
+-- Update note data record with comprehensive metadata (mutates in place — no full-list copy)
 on updateNoteData(existingData, noteID, noteModDate, noteCreatedDate, fileName, fullNoteID)
     set currentTime to (current date as string)
-    set foundExisting to false
-    set newData to {}
-
-    -- Go through existing data and update if found
-    if (count of existingData) > 0 then
-        repeat with i from 1 to count of existingData
-            set currentRecord to item i of existingData
-            if (noteID_key of currentRecord) = noteID then
-                -- Update existing record, preserve firstExported
-                set newRecord to {noteID_key:noteID, filename:fileName, created:(noteCreatedDate as string), modified:(noteModDate as string), firstExported:(firstExported of currentRecord), lastExported:currentTime, exportCount:((exportCount of currentRecord) + 1), fullNoteId:fullNoteID}
-                set foundExisting to true
-            else
-                -- Keep existing record unchanged
-                set newRecord to currentRecord
-            end if
-            set end of newData to newRecord
-        end repeat
-    end if
-
-    -- If not found, add new record
-    if not foundExisting then
-        set newRecord to {noteID_key:noteID, filename:fileName, created:(noteCreatedDate as string), modified:(noteModDate as string), firstExported:currentTime, lastExported:currentTime, exportCount:1, fullNoteId:fullNoteID}
-        set end of newData to newRecord
-    end if
-
-    return newData
+    repeat with i from 1 to count of existingData
+        set currentRecord to item i of existingData
+        if (noteID_key of currentRecord) = noteID then
+            set item i of existingData to {noteID_key:noteID, filename:fileName, created:(noteCreatedDate as string), modified:(noteModDate as string), firstExported:(firstExported of currentRecord), lastExported:currentTime, exportCount:((exportCount of currentRecord) + 1), fullNoteId:fullNoteID}
+            return existingData
+        end if
+    end repeat
+    set end of existingData to {noteID_key:noteID, filename:fileName, created:(noteCreatedDate as string), modified:(noteModDate as string), firstExported:currentTime, lastExported:currentTime, exportCount:1, fullNoteId:fullNoteID}
+    return existingData
 end updateNoteData
+
+-- Single-pass lookup: returns {shouldProcess, oldFilename} to avoid scanning existingData twice
+on getProcessingInfo(existingData, noteID, noteModDate)
+    repeat with currentRecord in existingData
+        if (noteID_key of currentRecord) = noteID then
+            set storedModDate to (modified of currentRecord)
+            if storedModDate = (noteModDate as string) then
+                return {shouldProcess:false, oldFilename:(filename of currentRecord)}
+            else
+                return {shouldProcess:true, oldFilename:(filename of currentRecord)}
+            end if
+        end if
+    end repeat
+    return {shouldProcess:true, oldFilename:""}
+end getProcessingInfo
 
 -- Check if a note should be processed based on modification date (optimized string conversion)
 on shouldProcessNote(existingData, noteID, noteModDate)
@@ -733,43 +730,33 @@ on shouldProcessNote(existingData, noteID, noteModDate)
     return true -- new note (not found in existing data)
 end shouldProcessNote
 
--- Mark notes as deleted if they no longer exist in the current export
+-- Mark notes as deleted if they no longer exist in the current export (O(N) lookup via delimited string)
 on markDeletedNotes(existingData, currentNoteIDs)
     set currentTime to (current date as string)
-    set newData to {}
-    
-    repeat with currentRecord in existingData
+    -- Build "|id1|id2|...|" once — native string search is faster than AS list contains
+    set AppleScript's text item delimiters to "|"
+    set lookupStr to "|" & (currentNoteIDs as string) & "|"
+    set AppleScript's text item delimiters to ""
+
+    repeat with i from 1 to count of existingData
+        set currentRecord to item i of existingData
         set recordNoteID to (noteID_key of currentRecord)
-        
-        if currentNoteIDs contains recordNoteID then
-            -- Note still exists, keep record unchanged
-            set end of newData to currentRecord
-        else
-            -- Note was deleted, mark it
+        if lookupStr does not contain ("|" & recordNoteID & "|") then
             set alreadyDeleted to false
             try
                 set testDeleted to (deletedDate of currentRecord)
                 set alreadyDeleted to true
-            on error
-                -- deletedDate doesn't exist, so not already marked as deleted
-                set alreadyDeleted to false
             end try
-            
             if not alreadyDeleted then
-                set deletedRecord to {noteID_key:(noteID_key of currentRecord), filename:(filename of currentRecord), created:(created of currentRecord), modified:(modified of currentRecord), firstExported:(firstExported of currentRecord), lastExported:(lastExported of currentRecord), exportCount:(exportCount of currentRecord), deletedDate:currentTime}
-                -- Preserve fullNoteId if present
+                set deletedRecord to {noteID_key:recordNoteID, filename:(filename of currentRecord), created:(created of currentRecord), modified:(modified of currentRecord), firstExported:(firstExported of currentRecord), lastExported:(lastExported of currentRecord), exportCount:(exportCount of currentRecord), deletedDate:currentTime}
                 try
                     set deletedRecord to deletedRecord & {fullNoteId:(fullNoteId of currentRecord)}
                 end try
-                set end of newData to deletedRecord
-            else
-                -- Already marked as deleted, keep as is
-                set end of newData to currentRecord
+                set item i of existingData to deletedRecord
             end if
         end if
     end repeat
-    
-    return newData
+    return existingData
 end markDeletedNotes
 
 on saveNotebookData(filePath, dataRecord)
@@ -861,27 +848,27 @@ print('Successfully saved data to file')
     end try
 end saveNotebookData
 
--- Convert data record to string for Python
+-- Convert data record to string for Python (O(N) list-join instead of O(N²) &-in-loop)
 on convertDataToString(dataRecord)
-    set recordString to ""
+    set parts to {}
     repeat with i from 1 to count of dataRecord
         set currentRecord to item i of dataRecord
         set recordArray to "['" & (noteID_key of currentRecord) & "','" & (filename of currentRecord) & "','" & (created of currentRecord) & "','" & (modified of currentRecord) & "','" & (firstExported of currentRecord) & "','" & (lastExported of currentRecord) & "'," & (exportCount of currentRecord)
-        -- Add deletedDate field
         try
             set recordArray to recordArray & ",'" & (deletedDate of currentRecord) & "'"
         on error
             set recordArray to recordArray & ",''"
         end try
-        -- Add fullNoteId field
         try
             set recordArray to recordArray & ",'" & (fullNoteId of currentRecord) & "']"
         on error
             set recordArray to recordArray & ",'']"
         end try
-        set recordString to recordString & recordArray
-        if i < count of dataRecord then set recordString to recordString & ","
+        set end of parts to recordArray
     end repeat
+    set AppleScript's text item delimiters to ","
+    set recordString to parts as string
+    set AppleScript's text item delimiters to ""
     return recordString
 end convertDataToString
 
